@@ -36,7 +36,7 @@ pip install numpy matplotlib
 ### Running the Program
 Run the Python script:
 ```bash
-python pathfinding.py
+python grid_abstraction.py
 ```
 
 ### Output
