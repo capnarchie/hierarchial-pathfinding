@@ -256,34 +256,41 @@ def plot_grid_fast(grid, direct_path=None, refined_path=None, abstract_path=None
     
     grid_data = np.array([[1 if node.cost != float('inf') else 0 for node in row] for row in grid])
     
-    fig, ax = plt.subplots(figsize=(10, 10))
+    fig, ax = plt.subplots(figsize=(10, 10), facecolor="#000000")  # Light gray background
     
-    cmap = mcolors.ListedColormap(["black", "darkblue"])
-    ax.imshow(grid_data, cmap=cmap, origin='lower')
-    
+    cmap = mcolors.ListedColormap(["#757575", "#5d98c9"])  # Soft gray and steel blue
+    ax.imshow(grid_data, cmap=cmap, origin='lower', alpha=0.9)
+
+    # Path styles with muted colors
     if direct_path:
         path_cols = [p[1] for p in direct_path]
         path_rows = [p[0] for p in direct_path]
-        ax.plot(path_cols, path_rows, 'g-', linewidth=2, label='Direct A* Path')
-    
+        ax.plot(path_cols, path_rows, color='#2afa96', linewidth=2, alpha=0.8, linestyle='-', label='Direct A* Path')  # Soft green
+
     if refined_path:
         path_cols = [p[1] for p in refined_path]
         path_rows = [p[0] for p in refined_path]
-        ax.plot(path_cols, path_rows, 'r-', linewidth=2, label='Abstract-Refined A* Path')
+        ax.plot(path_cols, path_rows, color='#FF7043', linewidth=2, alpha=0.8, linestyle='-', label='Refined A* Path')  # Soft orange-red
 
     if abstract_path and cluster_map:
         centers_cols = [cluster_map[key].y for key in abstract_path]
         centers_rows = [cluster_map[key].x for key in abstract_path]
-        ax.plot(centers_cols, centers_rows, color='orange', linestyle='--',
-                linewidth=2, label='Abstract Path')
+        ax.plot(centers_cols, centers_rows, color='#FFD54F', linestyle='--', linewidth=2, alpha=0.8, label='Abstract Path')  # Soft yellow
 
     if cluster_map:
         cluster_centers_x = [sn.x for sn in cluster_map.values()]
         cluster_centers_y = [sn.y for sn in cluster_map.values()]
-        ax.scatter(cluster_centers_y, cluster_centers_x, color='cyan', s=1, label='Cluster Centers')
+        ax.scatter(cluster_centers_y, cluster_centers_x, color='#020d6b', s=1, edgecolors='#1E88E5', linewidth=0.8, label='Cluster Centers')  # Soft blue
 
-    ax.set_title("Comparison of Direct and Abstract-Refined A* Paths")
-    ax.legend()
+    # Stylish labels and legend
+    ax.set_title("Pathfinding Visualization", fontsize=14, color="#333", fontweight="bold")
+    ax.legend(loc='upper right', facecolor="white", edgecolor="gray", fontsize=10, framealpha=0.9)
+    
+    # Hide default ticks for a cleaner look
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
+    plt.tight_layout()
     plt.show()
 
 # -----------------------------------------------
@@ -374,13 +381,13 @@ if __name__ == '__main__':
         exit(1)
     
     # --- Direct A* search (full grid) ---
-    # t0 = time.time()
-    # direct_path = a_star_grid(grid, start, goal)
-    # t_direct = time.time() - t0
-    # if direct_path is None:
-    #     print("No path found with direct A*!")
-    #     exit(1)
-    # print("Direct A* search time: {:.4f} seconds".format(t_direct))
+    t0 = time.time()
+    direct_path = a_star_grid(grid, start, goal)
+    t_direct = time.time() - t0
+    if direct_path is None:
+        print("No path found with direct A*!")
+        exit(1)
+    print("Direct A* search time: {:.4f} seconds".format(t_direct))
     
     # --- High-level (abstract) path planning ---
     t1 = time.time()
@@ -403,8 +410,8 @@ if __name__ == '__main__':
     print("Total abstract-refined method time: {:.4f} seconds".format(t_abstract_total))
     
     # --- Speedup factors ---
-    # speedup = t_direct / t_refinement if t_abstract_total > 0 else float('inf')
-    # print("Speedup factor (direct A* time / abstract-refined time): {:.4f}".format(speedup))
+    speedup = t_direct / t_refinement if t_abstract_total > 0 else float('inf')
+    print("Speedup factor (direct A* time / abstract-refined time): {:.4f}".format(speedup))
     
     # Plot the results.
-    plot_grid_fast(grid, direct_path=None, refined_path=refined_path, abstract_path=abstract_path, cluster_map=cluster_map)
+    plot_grid_fast(grid, direct_path=direct_path, refined_path=refined_path, abstract_path=abstract_path, cluster_map=cluster_map)
