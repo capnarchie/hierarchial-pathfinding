@@ -1,10 +1,15 @@
+import time
 import numpy as np
 import random
 import matplotlib.pyplot as plt
 import heapq
+import matplotlib.colors as mcolors
+import noise
+import pickle
+from scipy.ndimage import distance_transform_edt  # Requires SciPy
 
 # Seed for reproducibility.
-random.seed(43908574390)
+random.seed(4190857439)
 
 # -----------------------------------------------
 # Node and Cluster (Supernode) classes.
@@ -19,11 +24,12 @@ class Node:
         self.cost = random.randint(1, 100)  # Random cost for free cells.
 
 class Supernode:
-    def __init__(self, nodes, cluster_bounds):
+    def __init__(self, nodes, cluster_bounds, clearance):
         self.nodes = nodes  # Free nodes in the cluster.
-        # Center computed as the arithmetic mean of free node positions.
-        self.x = int(sum(node.x for node in nodes) / len(nodes))
-        self.y = int(sum(node.y for node in nodes) / len(nodes))
+        # Instead of arithmetic mean, choose the free node with maximum clearance.
+        center_node = max(nodes, key=lambda node: clearance[node.x, node.y])
+        self.x = center_node.x
+        self.y = center_node.y
         # Average cost over the cluster (can be used in higher-level planning).
         self.cost = sum(node.cost for node in nodes) / len(nodes)
         self.bounds = cluster_bounds  # (min_x, max_x, min_y, max_y)
@@ -35,15 +41,32 @@ def create_grid(rows, cols):
     return grid
 
 def add_obstacles(grid, obstacle_probability=0.3):
-    """Randomly mark nodes as obstacles (cost == infinity)."""
-    for row in grid:
-        for node in row:
-            if random.random() < obstacle_probability:
-                node.cost = float('inf')  # Obstacle
+    """Randomly mark nodes as obstacles using Perlin noise."""
+    scale = 100.0  # Controls the frequency of noise patterns
+    threshold = 0.001  # Lower = more obstacles, higher = fewer
+
+    rows = len(grid)
+    cols = len(grid[0])
+    for x in range(rows):
+        for y in range(cols):
+            value = noise.pnoise2(x / scale, y / scale, octaves=2)
+            if value < threshold:
+                grid[x][y].cost = float('inf')
+
+def compute_clearance_grid(grid):
+    """
+    Compute a clearance map where each free cell gets a value equal to its distance
+    from the nearest obstacle. Uses SciPy's distance_transform_edt for speed.
+    """
+    rows, cols = len(grid), len(grid[0])
+    # Build a binary grid: 1 for free cell, 0 for obstacle.
+    grid_data = np.array([[0 if node.cost == float('inf') else 1 for node in row] for row in grid])
+    clearance = distance_transform_edt(grid_data)
+    return clearance
 
 # -----------------------------------------------
 # Partitioning: Fixed-size clusters.
-def partition_grid(grid, cluster_size):
+def partition_grid(grid, cluster_size, clearance):
     """
     Partition the grid into fixed-size blocks. Each block that contains
     at least one free node is turned into a Supernode.
@@ -65,7 +88,7 @@ def partition_grid(grid, cluster_size):
                         nodes.append(grid[x][y])
             if nodes:
                 cluster_bounds = (min_x, max_x, min_y, max_y)
-                clusters.append(Supernode(nodes, cluster_bounds))
+                clusters.append(Supernode(nodes, cluster_bounds, clearance))
     return clusters
 
 # -----------------------------------------------
@@ -99,7 +122,6 @@ def a_star_grid(grid, start, goal):
         for dx, dy in [(1,0), (-1,0), (0,1), (0,-1)]:
             nx, ny = x+dx, y+dy
             if 0 <= nx < rows and 0 <= ny < cols:
-                # Skip obstacles.
                 if grid[nx][ny].cost == float('inf'):
                     continue
                 tentative_g = g_score[current] + grid[nx][ny].cost
@@ -112,14 +134,38 @@ def a_star_grid(grid, start, goal):
     return None  # No path found.
 
 # -----------------------------------------------
+# Helper: For abstract planning, compute an edge cost that penalizes obstacles.
+def edge_cost_with_obstacles(sn, neighbor_sn, grid, num_samples=200):
+    """
+    Sample along the straight line between two cluster centers.
+    For each sample, if a grid cell is an obstacle, add a penalty.
+    """
+    dx = neighbor_sn.x - sn.x
+    dy = neighbor_sn.y - sn.y
+    distance = np.sqrt(dx**2 + dy**2)
+    
+    obstacle_count = 0
+    for i in range(num_samples + 1):
+        t = i / num_samples
+        x = int(round(sn.x + t * dx))
+        y = int(round(sn.y + t * dy))
+        # Make sure we are within bounds.
+        if x < 0 or x >= len(grid) or y < 0 or y >= len(grid[0]):
+            continue
+        if grid[x][y].cost == float('inf'):
+            obstacle_count += 1
+    ratio = obstacle_count / (num_samples + 1)
+    # Increase the cost by a factor proportional to the obstacle ratio.
+    penalty = 1 + ratio * 10000  # You can adjust the multiplier as needed.
+    return distance * penalty
+
+# -----------------------------------------------
 # Build the abstract graph over clusters.
-def build_abstract_graph(clusters, cluster_size):
+def build_abstract_graph(clusters, cluster_size, grid):
     """
     Returns:
       - graph: a dict mapping cluster indices (tuple) to a list of (neighbor_key, weight).
       - cluster_map: a dict mapping cluster indices to Supernode objects.
-    
-    Cluster indices are computed as (ci, cj) = (min_x // cluster_size, min_y // cluster_size).
     """
     cluster_map = {}
     for sn in clusters:
@@ -135,13 +181,12 @@ def build_abstract_graph(clusters, cluster_size):
             neighbor_key = (ci+di, cj+dj)
             if neighbor_key in cluster_map:
                 neighbor_sn = cluster_map[neighbor_key]
-                # Use Euclidean distance between cluster centers as weight.
-                weight = np.sqrt((sn.x - neighbor_sn.x)**2 + (sn.y - neighbor_sn.y)**2)
+                # Use a cost that incorporates obstacles along the line between clusters.
+                weight = edge_cost_with_obstacles(sn, neighbor_sn, grid)
                 neighbors.append((neighbor_key, weight))
         graph[(ci, cj)] = neighbors
     return graph, cluster_map
 
-# A* on the abstract graph.
 def a_star_abstract(graph, start_key, goal_key, cluster_map):
     open_set = []
     heapq.heappush(open_set, (0, start_key))
@@ -174,80 +219,71 @@ def a_star_abstract(graph, start_key, goal_key, cluster_map):
     return None
 
 # -----------------------------------------------
-# Plotting functions.
-def plot_grid(grid, path=None):
-    """Plot the full grid with obstacles (black) and free nodes (blue)."""
-    fig, ax = plt.subplots()
+# New helper: Refine path using abstract waypoints.
+def refine_path_with_abstract(grid, start, goal, abstract_path, cluster_map):
+    """
+    Given an abstract path (a list of cluster keys), compute a refined grid path by planning
+    between waypoints that include:
+      - The actual start position,
+      - The centers of the intermediate clusters (from the abstract path),
+      - The actual goal position.
+    """
+    # Build the waypoint list.
+    waypoints = [start]
+    if len(abstract_path) > 2:
+        # Exclude the first and last clusters (they correspond to the start/goal clusters)
+        for cluster_key in abstract_path[1:-1]:
+            waypoint = (cluster_map[cluster_key].x, cluster_map[cluster_key].y)
+            waypoints.append(waypoint)
+    waypoints.append(goal)
     
-    for row in grid:
-        for node in row:
-            if node.cost == float('inf'):
-                ax.plot(node.x, node.y, 'ks', markersize=4)  # Obstacle.
-            else:
-                ax.plot(node.x, node.y, 'bs', markersize=4)  # Free cell.
-                
-    if path is not None:
-        # Plot refined path in red.
-        xs = [p[0] for p in path]
-        ys = [p[1] for p in path]
-        ax.plot(xs, ys, 'r-', linewidth=2, label="Refined Path")
-        
-    ax.set_xlim(-1, len(grid))
-    ax.set_ylim(-1, len(grid[0]))
-    ax.set_aspect('equal')
-    plt.gca().invert_yaxis()
-    plt.title("Grid with Refined Path")
-    plt.legend()
-    plt.show()
+    # Now compute refined path segments between consecutive waypoints.
+    refined_path = []
+    for i in range(len(waypoints) - 1):
+        segment = a_star_grid(grid, waypoints[i], waypoints[i+1])
+        if segment is None:
+            return None  # If one segment fails, the overall refinement fails.
+        if i > 0:
+            # Avoid duplicating the waypoint.
+            segment = segment[1:]
+        refined_path.extend(segment)
+    return refined_path
 
-def plot_paths(grid, clusters, abstract_path, refined_path, cluster_map):
-    """
-    Plot the grid and clusters with:
-      - Cluster centers and boundaries (red),
-      - Abstract path (green dashed line between cluster centers),
-      - Refined path (red solid line along grid nodes).
-    """
-    fig, ax = plt.subplots()
+# -----------------------------------------------
+# Fast plotting function.
+def plot_grid_fast(grid, direct_path=None, refined_path=None, abstract_path=None, cluster_map=None):
+    rows, cols = len(grid), len(grid[0])
     
-    # Draw grid nodes.
-    for row in grid:
-        for node in row:
-            if node.cost == float('inf'):
-                ax.plot(node.x, node.y, 'ks', markersize=4)
-            else:
-                ax.plot(node.x, node.y, 'bs', markersize=4)
+    grid_data = np.array([[1 if node.cost != float('inf') else 0 for node in row] for row in grid])
     
-    # Draw clusters.
-    for sn in clusters:
-        ax.plot(sn.x, sn.y, 'ro', markersize=6)
-        min_x, max_x, min_y, max_y = sn.bounds
-        rect = plt.Rectangle((min_x - 0.5, min_y - 0.5),
-                 max_x - min_x + 1, max_y - min_y + 1,
-                 fill=False, edgecolor='lime', linestyle='--', linewidth=2000000)
-        ax.add_patch(rect)
+    fig, ax = plt.subplots(figsize=(10, 10))
     
-    # Draw abstract path (green dashed line).
-    if abstract_path is not None:
-        centers = [ (cluster_map[key].x, cluster_map[key].y) for key in abstract_path ]
-        xs = [p[0] for p in centers]
-        ys = [p[1] for p in centers]
-        ax.plot(xs, ys, 'orange', linestyle='--', linewidth=3, label="Abstract Path")
+    cmap = mcolors.ListedColormap(["black", "darkblue"])
+    ax.imshow(grid_data, cmap=cmap, origin='lower')
     
-    # Draw refined path (red solid line).
-    if refined_path is not None:
-        xs = [p[0] for p in refined_path]
-        ys = [p[1] for p in refined_path]
-        ax.plot(xs, ys, 'c-', linewidth=3, label="Refined Path")
-        ax.plot([], [], 'ro', markersize=4, label="Contracted Map")
-        ax.plot([], [], 'ks', markersize=4, label="Obstacle")
-        ax.plot([], [], 'bs', markersize=4, label="Walkable Node")
+    if direct_path:
+        path_cols = [p[1] for p in direct_path]
+        path_rows = [p[0] for p in direct_path]
+        ax.plot(path_cols, path_rows, 'g-', linewidth=2, label='Direct A* Path')
     
-    ax.set_xlim(-1, len(grid))
-    ax.set_ylim(-1, len(grid[0]))
-    ax.set_aspect('equal')
-    plt.gca().invert_yaxis()
-    plt.legend()
-    plt.title("Hierarchical Pathfinding")
+    if refined_path:
+        path_cols = [p[1] for p in refined_path]
+        path_rows = [p[0] for p in refined_path]
+        ax.plot(path_cols, path_rows, 'r-', linewidth=2, label='Abstract-Refined A* Path')
+
+    if abstract_path and cluster_map:
+        centers_cols = [cluster_map[key].y for key in abstract_path]
+        centers_rows = [cluster_map[key].x for key in abstract_path]
+        ax.plot(centers_cols, centers_rows, color='orange', linestyle='--',
+                linewidth=2, label='Abstract Path')
+
+    if cluster_map:
+        cluster_centers_x = [sn.x for sn in cluster_map.values()]
+        cluster_centers_y = [sn.y for sn in cluster_map.values()]
+        ax.scatter(cluster_centers_y, cluster_centers_x, color='cyan', s=1, label='Cluster Centers')
+
+    ax.set_title("Comparison of Direct and Abstract-Refined A* Paths")
+    ax.legend()
     plt.show()
 
 # -----------------------------------------------
@@ -267,31 +303,69 @@ def find_free_node(grid, default):
 # Main driver.
 if __name__ == '__main__':
     # Create grid and add obstacles.
-    rows, cols = 100, 100
-    grid = create_grid(rows, cols)
-    add_obstacles(grid, obstacle_probability=0.3)
+    # rows, cols = 2500, 2500
+    # start_time = time.time()
+    # grid = create_grid(rows, cols)
+    # print("Time to create grid:", time.time() - start_time)
+    # add_obstacles(grid, obstacle_probability=0.3)
     
-    # Partition grid into clusters (for abstraction).
-    cluster_size = 5
-    clusters = partition_grid(grid, cluster_size)
+    # # Compute clearance for the entire grid.
+    # clearance = compute_clearance_grid(grid)
     
-    # Build abstract graph (nodes are clusters indexed by (ci, cj)).
-    abstract_graph, cluster_map = build_abstract_graph(clusters, cluster_size)
+    # # Partition grid into clusters (for abstraction).
+    cluster_size = 10
+    # clusters = partition_grid(grid, cluster_size, clearance)
     
-    # Choose start and goal (user-defined) and ensure they are free.
-    start = (0,0)#find_free_node(grid, (0, 0))
-    goal  = (81,86)#find_free_node(grid, (rows-1, cols-1))
+    # # Build abstract graph (nodes are clusters indexed by (ci, cj)).
+    # abstract_graph, cluster_map = build_abstract_graph(clusters, cluster_size, grid)
+    # # Save grid, clearance, clusters, cluster_map, abstract_graph into memory
+    # def save_to_memory(filename, data):
+    #     with open(filename, 'wb') as f:
+    #         pickle.dump(data, f)
+
+    def load_from_memory(filename):
+        with open(filename, 'rb') as f:
+            return pickle.load(f)
+
+    # Filenames for saved data
+    grid_file = 'grid.pkl'
+    clearance_file = 'clearance.pkl'
+    clusters_file = 'clusters.pkl'
+    cluster_map_file = 'cluster_map.pkl'
+    abstract_graph_file = 'abstract_graph.pkl'
+
+    # # Save data
+    # save_to_memory(grid_file, grid)
+    # save_to_memory(clearance_file, clearance)
+    # save_to_memory(clusters_file, clusters)
+    # save_to_memory(cluster_map_file, cluster_map)
+    # save_to_memory(abstract_graph_file, abstract_graph)
+
+    # Load data using concurrent loading for speedup
+    import concurrent.futures
+
+    def load_data(filename):
+        return load_from_memory(filename)
+
+    start = time.time()
+    filenames = [grid_file, clearance_file, clusters_file, cluster_map_file, abstract_graph_file]
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        grid, clearance, clusters, cluster_map, abstract_graph = executor.map(load_data, filenames)
+    print("Time to load data:", time.time() - start)
+
+
+
+    # Choose start and goal.
+    start = (190, 294)
+    goal  = (1698, 436)
+    start = find_free_node(grid, start)
+    goal = find_free_node(grid, goal)
     if start is None or goal is None:
         print("No free nodes available for start/goal!")
         exit(1)
     
     print(f"Start: {start}, Goal: {goal}")
-    
-    # Low-level pathfinding on the grid.
-    refined_path = a_star_grid(grid, start, goal)
-    if refined_path is None:
-        print("No path found on the grid!")
-    
+
     # Identify the clusters that contain the start and goal.
     start_cluster_key = (start[0] // cluster_size, start[1] // cluster_size)
     goal_cluster_key  = (goal[0]  // cluster_size, goal[1]  // cluster_size)
@@ -299,13 +373,38 @@ if __name__ == '__main__':
         print("Start or goal not in any cluster!")
         exit(1)
     
-    # High-level (abstract) path planning.
+    # --- Direct A* search (full grid) ---
+    # t0 = time.time()
+    # direct_path = a_star_grid(grid, start, goal)
+    # t_direct = time.time() - t0
+    # if direct_path is None:
+    #     print("No path found with direct A*!")
+    #     exit(1)
+    # print("Direct A* search time: {:.4f} seconds".format(t_direct))
+    
+    # --- High-level (abstract) path planning ---
+    t1 = time.time()
     abstract_path = a_star_abstract(abstract_graph, start_cluster_key, goal_cluster_key, cluster_map)
+    t_abstract_planning = time.time() - t1
     if abstract_path is None:
         print("No abstract path found!")
+        exit(1)
+    print("Abstract A* planning time (high-level over clusters): {:.4f} seconds".format(t_abstract_planning))
+    
+    # --- Refinement using abstract waypoints ---
+    t2 = time.time()
+    refined_path = refine_path_with_abstract(grid, start, goal, abstract_path, cluster_map)
+    t_refinement = time.time() - t2
+    if refined_path is None:
+        print("No refined path found using abstract waypoints!")
+        exit(1)
+    t_abstract_total = t_abstract_planning + t_refinement
+    print("Refinement (using abstract waypoints) time: {:.4f} seconds".format(t_refinement))
+    print("Total abstract-refined method time: {:.4f} seconds".format(t_abstract_total))
+    
+    # --- Speedup factors ---
+    # speedup = t_direct / t_refinement if t_abstract_total > 0 else float('inf')
+    # print("Speedup factor (direct A* time / abstract-refined time): {:.4f}".format(speedup))
     
     # Plot the results.
-    # Plot grid with refined (low-level) path.
-    plot_grid(grid, refined_path)
-    # Plot both abstract and refined paths overlayed on the grid and clusters.
-    plot_paths(grid, clusters, abstract_path, refined_path, cluster_map)
+    plot_grid_fast(grid, direct_path=None, refined_path=refined_path, abstract_path=abstract_path, cluster_map=cluster_map)
