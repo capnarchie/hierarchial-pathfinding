@@ -45,10 +45,11 @@ python grid_abstraction.py
 - Then, it refines the path using **low-level A* search**.
 - Finally, it **visualizes** the grid, obstacles, clusters, and paths.
 
-#### Small Grid
+#### New implementation
+
+![output path small grid](Figure_3.png)
+
+#### 40x40 Grid(Old implementation)
 
 ![output path small grid](Figure_2.png)
 
-#### Big Grid
-
-![output path small grid](Figure_1.png)
